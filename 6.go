@@ -49,14 +49,14 @@ func copyFile(src, dst string) error {
     return nil
 }
 
-// Шаг 1. Скопировать бинарник /root/install/autodeploy.go в /root/auto_deploy/,
+// Шаг 1. Скопировать бинарник /root/install/autodeploy в /root/auto_deploy/,
 //        затем сделать /root/auto_deploy исполняемым (chmod -R +x).
 func step1CopyBinaryAndChmod() error {
-    log.Println("[Шаг 1] Копирую /root/install/autodeploy.go в /root/auto_deploy/autodeploy.go...")
+    log.Println("[Шаг 1] Копирую /root/install/autodeploy в /root/auto_deploy/autodeploy...")
 
-    // Допустим, что исходный файл находится именно по пути /root/install/autodeploy.go
-    // и мы хотим скопировать его в /root/auto_deploy/autodeploy.go
-    if err := copyFile("/root/install/autodeploy.go", "/root/auto_deploy/autodeploy.go"); err != nil {
+    // Допустим, что исходный файл находится именно по пути /root/install/autodeploy
+    // и мы хотим скопировать его в /root/auto_deploy/autodeploy
+    if err := copyFile("/root/install/autodeploy", "/root/auto_deploy/autodeploy"); err != nil {
         return err
     }
 
@@ -74,7 +74,7 @@ Description=Auto Deploy Nginx Sites on Folder Creation
 After=network.target mariadb.service nginx.service
 
 [Service]
-ExecStart=/root/auto_deploy/autodeploy.go
+ExecStart=/root/auto_deploy/autodeploy
 Restart=always
 RestartSec=5
 User=root
