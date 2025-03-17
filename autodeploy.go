@@ -331,15 +331,42 @@ func checkText3Attempts(domain, txt string) bool {
 }
 
 // ------------------------------
-// (9) Создать затычку
+// (9) Создать затычку с поддержкой 80 и 443 (с самоподписанным сертификатом)
 // ------------------------------
 func createStubConfig(domain string) {
+	// Каталог для самоподписанных сертификатов
+	selfSignedDir := "/etc/nginx/self-signed"
+	os.MkdirAll(selfSignedDir, 0755)
+	certPath := filepath.Join(selfSignedDir, domain+".crt")
+	keyPath := filepath.Join(selfSignedDir, domain+".key")
+
+	// Если сертификата нет, генерируем его
+	if _, err := os.Stat(certPath); os.IsNotExist(err) {
+		subj := fmt.Sprintf("/CN=%s", domain)
+		cmd := exec.Command("openssl", "req", "-x509", "-nodes", "-days", "365", "-newkey", "rsa:2048",
+			"-keyout", keyPath, "-out", certPath, "-subj", subj)
+		if err := cmd.Run(); err != nil {
+			log.Printf("[ERROR] Не удалось создать самоподписанный сертификат для %s: %v", domain, err)
+		} else {
+			log.Printf("[INFO] Самоподписанный сертификат создан для %s", domain)
+		}
+	}
+
 	confpath := filepath.Join(NGINX_AVAILABLE, domain)
 	stub := fmt.Sprintf(`server {
     listen 80;
     server_name %s www.%s;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name %s www.%s;
     root /var/www/%s;
     index index.html index.php;
+
+    ssl_certificate %s;
+    ssl_certificate_key %s;
 
     location / {
         try_files $uri $uri/ @blank;
@@ -349,12 +376,14 @@ func createStubConfig(domain string) {
         return 200 "";
     }
 }
-`, domain, domain, domain)
-	err := os.WriteFile(confpath, []byte(stub), 0644)
-	if err != nil {
+`, domain, domain, domain, domain, domain, certPath, keyPath)
+
+	if err := os.WriteFile(confpath, []byte(stub), 0644); err != nil {
 		log.Printf("[ERROR] Ошибка при создании затычки: %v", err)
 		return
 	}
+	// Удаляем старую симлинк, если есть
+	os.Remove(filepath.Join(NGINX_ENABLED, domain))
 	_ = os.Symlink(confpath, filepath.Join(NGINX_ENABLED, domain))
 	_ = runCmd("nginx", "-t")
 	_ = runCmd("systemctl", "reload", "nginx")
@@ -469,7 +498,7 @@ func main() {
 		} else {
 			log.Printf("[INFO] Пропускаем установку CloudFlare SSL (flexible) для %s.", realdom)
 		}
-		// (G) Создание затычки
+		// (G) Создание затычки (с поддержкой 80 и 443)
 		createStubConfig(realdom)
 		// (H) Проверка 9-символьного текста
 		rtext, err := generate9chars()
@@ -617,6 +646,13 @@ func main() {
 				} else {
 					log.Printf("[INFO] Пропускаем установку CloudFlare SSL (full) для %s.", realdom)
 				}
+				// Удаляем временные самоподписанные сертификаты, так как теперь используется валидный сертификат
+				selfSignedDir := "/etc/nginx/self-signed"
+				certPath := filepath.Join(selfSignedDir, realdom+".crt")
+				keyPath := filepath.Join(selfSignedDir, realdom+".key")
+				os.Remove(certPath)
+				os.Remove(keyPath)
+				log.Printf("[INFO] Удалены временные самоподписанные сертификаты для %s", realdom)
 			} else {
 				log.Println("[ERROR] Ошибка SSL!")
 				suffix := getErrorSuffix(baseIdx, "other")
