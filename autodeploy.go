@@ -40,13 +40,6 @@ var (
 	useCloudflare = true // Флаг для использования CloudFlare
 )
 
-// CloudflareCredentials хранит данные для работы с API CloudFlare.
-type CloudflareCredentials struct {
-	ZoneID string
-	Email  string
-	APIKey string
-}
-
 // ------------------------------
 // Вспомогательные функции
 // ------------------------------
@@ -150,14 +143,16 @@ func getErrorSuffix(idx string, etype string) string {
 
 // ------------------------------
 // (4) Проверка домена в Cloudflare (3 попытки, 15 сек)
-//     Возвращает (*CloudflareCredentials, true) при успехе или (nil, false)
+//     Возвращает true/false
 // ------------------------------
-func checkDomainCloudflare(domain string) (*CloudflareCredentials, bool) {
+var CLOUDFLARE_ZONE_ID, CLOUDFLARE_EMAIL, CLOUDFLARE_API_KEY string
+
+func checkDomainCloudflare(domain string) bool {
 	log.Println("[INFO] Проверяем домен", domain, "в Cloudflare...")
 	data, err := os.ReadFile(CLOUDFLARE_TXT)
 	if err != nil {
 		log.Printf("[ERROR] Невозможно прочитать %s: %v", CLOUDFLARE_TXT, err)
-		return nil, false
+		return false
 	}
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
@@ -214,18 +209,16 @@ func checkDomainCloudflare(domain string) (*CloudflareCredentials, bool) {
 				dnsName := parseJSON(dnsResp, ".result[0].name")
 				if dnsName == domain && dnsContent == SERVER_IP {
 					log.Printf("[INFO] DNS=%s совпадает с %s", dnsContent, SERVER_IP)
-					creds := &CloudflareCredentials{
-						ZoneID: zoneID,
-						Email:  email,
-						APIKey: token,
-					}
-					return creds, true
+					CLOUDFLARE_ZONE_ID = zoneID
+					CLOUDFLARE_EMAIL = email
+					CLOUDFLARE_API_KEY = token
+					return true
 				}
 			}
 		}
 	}
 	log.Printf("[ERROR] Не нашли активную зону для %s c IP=%s", domain, SERVER_IP)
-	return nil, false
+	return false
 }
 
 // parseJSON — простая функция для извлечения поля через jq (без дополнительного парсинга)
@@ -246,10 +239,10 @@ func parseJSON(jsonText, jqFilter string) string {
 // ------------------------------
 // (5) set_cf_ssl_mode (flexible|full), sleep 5
 // ------------------------------
-func setCFSSLMode(mode string, creds *CloudflareCredentials) {
-	z := creds.ZoneID
-	email := creds.Email
-	token := creds.APIKey
+func setCFSSLMode(mode string) {
+	z := CLOUDFLARE_ZONE_ID
+	email := CLOUDFLARE_EMAIL
+	token := CLOUDFLARE_API_KEY
 	log.Printf("[INFO] Ставим SSL=%s (zone=%s)...", mode, z)
 	resp, err := runCmdOutput("curl", "-s", "-X", "PATCH",
 		fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/settings/ssl", z),
@@ -274,10 +267,10 @@ func setCFSSLMode(mode string, creds *CloudflareCredentials) {
 // ------------------------------
 // (6) apply_default_cf_settings
 // ------------------------------
-func applyDefaultCFSettings(creds *CloudflareCredentials) {
-	z := creds.ZoneID
-	email := creds.Email
-	token := creds.APIKey
+func applyDefaultCFSettings() {
+	z := CLOUDFLARE_ZONE_ID
+	email := CLOUDFLARE_EMAIL
+	token := CLOUDFLARE_API_KEY
 	log.Println("[INFO] Применяем дефолтные настройки CF в новом порядке...")
 	patchSetting := func(key, val string) {
 		resp, err := runCmdOutput("curl", "-s", "-X", "PATCH",
@@ -398,275 +391,8 @@ server {
 }
 
 // ------------------------------
-// handleEvent обрабатывает каждое событие inotify
+// MAIN
 // ------------------------------
-func handleEvent(line string) {
-	fields := strings.SplitN(line, " ", 3)
-	if len(fields) < 3 {
-		return
-	}
-	folderName := fields[2]
-	cleanOldLogs()
-	log.Printf("[INFO] Обнаружена папка: %s", folderName)
-	// (B) Удаление сайтов с окончанием _777
-	if strings.HasSuffix(folderName, "_777") {
-		realdom := strings.TrimSuffix(folderName, "_777")
-		log.Printf("[INFO] Удаляем сайт %s...", realdom)
-		_ = runCmd("mysql", "-u", "root", "-e", fmt.Sprintf("DROP DATABASE IF EXISTS `%s`;", realdom))
-		_ = runCmd("mysql", "-u", "root", "-e", fmt.Sprintf("DROP USER IF EXISTS '%s'@'localhost';", realdom))
-		os.RemoveAll(filepath.Join(WATCH_DIR, folderName))
-		os.Remove(filepath.Join(NGINX_ENABLED, realdom))
-		os.Remove(filepath.Join(NGINX_AVAILABLE, realdom))
-		os.RemoveAll(filepath.Join("/etc/letsencrypt/live", realdom))
-		os.RemoveAll(filepath.Join("/etc/letsencrypt/archive", realdom))
-		os.Remove(filepath.Join("/etc/letsencrypt/renewal", realdom+".conf"))
-		_ = runCmd("nginx", "-t")
-		_ = runCmd("systemctl", "reload", "nginx")
-		log.Printf("[INFO] Сайт %s успешно удалён.", realdom)
-		return
-	}
-	// (C) Проверка наличия статуса (idx 0..7)
-	parts := strings.Split(folderName, "_")
-	if len(parts) < 2 {
-		log.Printf("[ERROR] Папка %s не соответствует статусам 0..7. Пропускаем.", folderName)
-		return
-	}
-	baseIdx := parts[len(parts)-1]
-	if !strings.ContainsAny(baseIdx, "01234567") || len(baseIdx) != 1 {
-		log.Printf("[ERROR] Папка %s не соответствует статусам 0..7. Пропускаем.", folderName)
-		return
-	}
-	// (D) Переименование папки
-	realdom := strings.Join(parts[:len(parts)-1], "_")
-	log.Printf("[INFO] Переименовываем %s -> %s", folderName, realdom)
-	if realdom == "" {
-		log.Printf("[ERROR] realdom пуст!")
-		return
-	}
-	oldPath := filepath.Join(WATCH_DIR, folderName)
-	newPath := filepath.Join(WATCH_DIR, realdom)
-	os.Rename(oldPath, newPath)
-	// (E) Проверка домена через CloudFlare, если используется
-	var cfCreds *CloudflareCredentials
-	if useCloudflare {
-		var ok bool
-		cfCreds, ok = checkDomainCloudflare(realdom)
-		if !ok {
-			log.Println("[ERROR] Cloudflare ошибка!")
-			suffix := getErrorSuffix(baseIdx, "cloudflare")
-			newName := fmt.Sprintf("%s_%s", realdom, suffix)
-			log.Printf("[INFO] Переименовываем => %s", newName)
-			os.Rename(newPath, filepath.Join(WATCH_DIR, newName))
-			return
-		}
-	} else {
-		log.Printf("[INFO] Пропускаем проверку CloudFlare для %s, т.к. данные CloudFlare не заданы.", realdom)
-	}
-	// (F) Установка SSL flexible через CloudFlare (если используется)
-	if useCloudflare {
-		setCFSSLMode("flexible", cfCreds)
-	} else {
-		log.Printf("[INFO] Пропускаем установку CloudFlare SSL (flexible) для %s.", realdom)
-	}
-	// (G) Создание затычки (с поддержкой 80 и 443)
-	createStubConfig(realdom)
-	// (H) Проверка 9-символьного текста
-	rtext, err := generate9chars()
-	if err != nil {
-		log.Printf("[ERROR] Не смогли сгенерировать 9-символьный текст: %v", err)
-		return
-	}
-	log.Printf("[INFO] Случайный текст: %s", rtext)
-	os.MkdirAll(filepath.Join("/var/www", realdom), 0755)
-	indexFile := filepath.Join("/var/www", realdom, "index.php")
-	os.WriteFile(indexFile, []byte(rtext), 0644)
-	runCmd("chown", "-R", "www-data:www-data", filepath.Join("/var/www", realdom))
-	runCmd("find", filepath.Join("/var/www", realdom), "-type", "d", "-exec", "chmod", "755", "{}", ";")
-	runCmd("find", filepath.Join("/var/www", realdom), "-type", "f", "-exec", "chmod", "644", "{}", ";")
-	if !checkText3Attempts(realdom, rtext) {
-		log.Printf("[ERROR] Не нашли текст %s!", rtext)
-		suffix := getErrorSuffix(baseIdx, "check_text")
-		newName := fmt.Sprintf("%s_%s", realdom, suffix)
-		os.Remove(filepath.Join(NGINX_ENABLED, realdom))
-		os.Remove(filepath.Join(NGINX_AVAILABLE, realdom))
-		os.Rename(filepath.Join("/var/www", realdom), filepath.Join("/var/www", newName))
-		return
-	} else {
-		log.Printf("[INFO] Текст найден, удаляем проверочный index.php...")
-		os.Remove(indexFile)
-	}
-	// (I) Определяем тип сайта, необходимость SSL и использование www
-	siteType := "static"
-	sslNeeded := "no"
-	useWww := "no"
-	switch baseIdx {
-	case "0":
-		siteType = "static"
-		sslNeeded = "no"
-		useWww = "no"
-	case "1":
-		siteType = "static"
-		sslNeeded = "no"
-		useWww = "yes"
-	case "2":
-		siteType = "static"
-		sslNeeded = "yes"
-		useWww = "no"
-	case "3":
-		siteType = "static"
-		sslNeeded = "yes"
-		useWww = "yes"
-	case "4":
-		siteType = "wp"
-		sslNeeded = "no"
-		useWww = "no"
-	case "5":
-		siteType = "wp"
-		sslNeeded = "no"
-		useWww = "yes"
-	case "6":
-		siteType = "wp"
-		sslNeeded = "yes"
-		useWww = "no"
-	case "7":
-		siteType = "wp"
-		sslNeeded = "yes"
-		useWww = "yes"
-	}
-	log.Printf("[INFO] site_type=%s, ssl_needed=%s, domain=%s", siteType, sslNeeded, realdom)
-	// (J) Генерация паролей
-	dbPass, _ := runCmdOutput("bash", "-c", "openssl rand -base64 12 | tr -dc A-Za-z0-9 | head -c9")
-	adminPass, _ := runCmdOutput("bash", "-c", "openssl rand -base64 12 | tr -dc A-Za-z0-9 | head -c12")
-	// (K) Выбор финального шаблона
-	finalTemplate := ""
-	if sslNeeded == "no" && useWww == "no" {
-		finalTemplate = TPL_NOSSL_NOWWW
-	} else if sslNeeded == "no" && useWww == "yes" {
-		finalTemplate = TPL_NOSSL_WWW
-	} else if sslNeeded == "yes" && useWww == "no" {
-		finalTemplate = TPL_SSL_NOWWW
-	} else {
-		finalTemplate = TPL_SSL_WWW
-	}
-	// (L) Деплой: статический сайт или WordPress
-	if siteType == "static" {
-		log.Println("[INFO] Статический => создаём index.php c 'IN'")
-		os.WriteFile(filepath.Join("/var/www", realdom, "index.php"), []byte("<?php echo 'IN'; ?>"), 0644)
-	} else {
-		log.Println("[INFO] Устанавливаем WordPress...")
-		os.Chdir(filepath.Join("/var/www", realdom))
-		runCmd("wp", "core", "download", "--allow-root")
-		runCmd("mysql", "-u", "root", "-e", fmt.Sprintf("CREATE DATABASE `%s`;", realdom))
-		runCmd("mysql", "-u", "root", "-e", fmt.Sprintf("CREATE USER '%s'@'localhost' IDENTIFIED BY '%s';", realdom, dbPass))
-		runCmd("mysql", "-u", "root", "-e", fmt.Sprintf("GRANT ALL ON `%s`.* TO '%s'@'localhost';", realdom, realdom))
-		runCmd("mysql", "-u", "root", "-e", "FLUSH PRIVILEGES;")
-		runCmd("wp", "config", "create",
-			fmt.Sprintf("--dbname=%s", realdom),
-			fmt.Sprintf("--dbuser=%s", realdom),
-			fmt.Sprintf("--dbpass=%s", dbPass),
-			"--dbhost=localhost",
-			"--allow-root",
-		)
-		fcfg, _ := os.OpenFile("wp-config.php", os.O_APPEND|os.O_WRONLY, 0644)
-		if fcfg != nil {
-			fcfg.WriteString("define('FS_METHOD','direct');\n")
-			fcfg.Close()
-		}
-		siteURL := fmt.Sprintf("https://%s", realdom)
-		if useWww == "yes" {
-			siteURL = fmt.Sprintf("https://www.%s", realdom)
-		}
-		runCmd("wp", "core", "install",
-			fmt.Sprintf("--url=%s", siteURL),
-			fmt.Sprintf("--title=%s Site", realdom),
-			fmt.Sprintf("--admin_user=%s", realdom),
-			fmt.Sprintf("--admin_password=%s", adminPass),
-			fmt.Sprintf("--admin_email=admin@%s", realdom),
-			"--allow-root",
-		)
-		fwp, _ := os.OpenFile(WP_LOG, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-		if fwp != nil {
-			line := fmt.Sprintf("%s|%s|%s|%s|%s\n", realdom, realdom, adminPass, realdom, dbPass)
-			fwp.WriteString(line)
-			fwp.Close()
-		}
-	}
-	runCmd("chown", "-R", "www-data:www-data", filepath.Join("/var/www", realdom))
-	runCmd("find", filepath.Join("/var/www", realdom), "-type", "d", "-exec", "chmod", "755", "{}", ";")
-	runCmd("find", filepath.Join("/var/www", realdom), "-type", "f", "-exec", "chmod", "644", "{}", ";")
-	// (M) Если нужен SSL, запускаем certbot и обновляем конфигурацию
-	if sslNeeded == "yes" {
-		log.Printf("[INFO] Выпускаем SSL (certbot) для %s...", realdom)
-		errC := runCmd("certbot", "--nginx", "-d", realdom, "--non-interactive", "--agree-tos", "-m", fmt.Sprintf("admin@%s", realdom))
-		if errC == nil {
-			log.Println("[INFO] SSL выпущен => убираем затычку, ставим финальный SSL, CF=full")
-			os.Remove(filepath.Join(NGINX_ENABLED, realdom))
-			os.Remove(filepath.Join(NGINX_AVAILABLE, realdom))
-			newConf := filepath.Join(NGINX_AVAILABLE, realdom)
-			dataTempl, errF := os.ReadFile(finalTemplate)
-			if errF == nil {
-				confText := strings.ReplaceAll(string(dataTempl), "{{ domain_name }}", realdom)
-				os.WriteFile(newConf, []byte(confText), 0644)
-			}
-			os.Symlink(newConf, filepath.Join(NGINX_ENABLED, realdom))
-			runCmd("nginx", "-t")
-			runCmd("systemctl", "reload", "nginx")
-			if useCloudflare {
-				setCFSSLMode("full", cfCreds)
-			} else {
-				log.Printf("[INFO] Пропускаем установку CloudFlare SSL (full) для %s.", realdom)
-			}
-			// Удаляем временные самоподписанные сертификаты, так как теперь используется валидный сертификат
-			selfSignedDir := "/etc/nginx/self-signed"
-			certPath := filepath.Join(selfSignedDir, realdom+".crt")
-			keyPath := filepath.Join(selfSignedDir, realdom+".key")
-			os.Remove(certPath)
-			os.Remove(keyPath)
-			log.Printf("[INFO] Удалены временные самоподписанные сертификаты для %s", realdom)
-		} else {
-			log.Println("[ERROR] Ошибка SSL!")
-			suffix := getErrorSuffix(baseIdx, "other")
-			newName := fmt.Sprintf("%s_%s", realdom, suffix)
-			os.Remove(filepath.Join(NGINX_ENABLED, realdom))
-			os.Remove(filepath.Join(NGINX_AVAILABLE, realdom))
-			os.RemoveAll(filepath.Join("/var/www", realdom))
-			os.RemoveAll(filepath.Join("/etc/letsencrypt/live", realdom))
-			os.RemoveAll(filepath.Join("/etc/letsencrypt/archive", realdom))
-			os.Remove(filepath.Join("/etc/letsencrypt/renewal", realdom+".conf"))
-			os.Mkdir(filepath.Join(WATCH_DIR, newName), 0755)
-			runCmd("nginx", "-t")
-			runCmd("systemctl", "reload", "nginx")
-			return
-		}
-	} else {
-		log.Println("[INFO] SSL не нужен => убираем затычку, ставим final_template, CF=flexible")
-		os.Remove(filepath.Join(NGINX_ENABLED, realdom))
-		os.Remove(filepath.Join(NGINX_AVAILABLE, realdom))
-		newConf := filepath.Join(NGINX_AVAILABLE, realdom)
-		dataTempl, errF := os.ReadFile(finalTemplate)
-		if errF == nil {
-			confText := strings.ReplaceAll(string(dataTempl), "{{ domain_name }}", realdom)
-			os.WriteFile(newConf, []byte(confText), 0644)
-		}
-		os.Symlink(newConf, filepath.Join(NGINX_ENABLED, realdom))
-		runCmd("nginx", "-t")
-		runCmd("systemctl", "reload", "nginx")
-		if useCloudflare {
-			setCFSSLMode("flexible", cfCreds)
-		} else {
-			log.Printf("[INFO] Пропускаем установку CloudFlare SSL (flexible) для %s.", realdom)
-		}
-	}
-	// (N) Применяем дефолтные настройки CloudFlare, если используется
-	if useCloudflare {
-		log.Println("[INFO] Применяем финальные дефолтные настройки CF...")
-		applyDefaultCFSettings(cfCreds)
-	} else {
-		log.Println("[INFO] CloudFlare не настроен, пропускаем применение настроек CF.")
-	}
-	log.Printf("[INFO] Сайт %s развернут успешно.", realdom)
-}
-
 func main() {
 	ip, err := runCmdOutput("bash", "-c", SERVER_IP_COMMAND)
 	if err == nil {
@@ -708,8 +434,267 @@ func main() {
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		line := scanner.Text()
-		// Запускаем обработку события в отдельной горутине
-		go handleEvent(line)
+		fields := strings.SplitN(line, " ", 3)
+		if len(fields) < 3 {
+			continue
+		}
+		folderName := fields[2]
+		cleanOldLogs()
+		log.Printf("[INFO] Обнаружена папка: %s", folderName)
+		// (B) Удаление сайтов с окончанием _777
+		if strings.HasSuffix(folderName, "_777") {
+			realdom := strings.TrimSuffix(folderName, "_777")
+			log.Printf("[INFO] Удаляем сайт %s...", realdom)
+			_ = runCmd("mysql", "-u", "root", "-e", fmt.Sprintf("DROP DATABASE IF EXISTS `%s`;", realdom))
+			_ = runCmd("mysql", "-u", "root", "-e", fmt.Sprintf("DROP USER IF EXISTS '%s'@'localhost';", realdom))
+			os.RemoveAll(filepath.Join(WATCH_DIR, folderName))
+			os.Remove(filepath.Join(NGINX_ENABLED, realdom))
+			os.Remove(filepath.Join(NGINX_AVAILABLE, realdom))
+			os.RemoveAll(filepath.Join("/etc/letsencrypt/live", realdom))
+			os.RemoveAll(filepath.Join("/etc/letsencrypt/archive", realdom))
+			os.Remove(filepath.Join("/etc/letsencrypt/renewal", realdom+".conf"))
+			_ = runCmd("nginx", "-t")
+			_ = runCmd("systemctl", "reload", "nginx")
+			log.Printf("[INFO] Сайт %s успешно удалён.", realdom)
+			continue
+		}
+		// (C) Проверка наличия статуса (idx 0..7)
+		parts := strings.Split(folderName, "_")
+		if len(parts) < 2 {
+			log.Printf("[ERROR] Папка %s не соответствует статусам 0..7. Пропускаем.", folderName)
+			continue
+		}
+		baseIdx := parts[len(parts)-1]
+		if !strings.ContainsAny(baseIdx, "01234567") || len(baseIdx) != 1 {
+			log.Printf("[ERROR] Папка %s не соответствует статусам 0..7. Пропускаем.", folderName)
+			continue
+		}
+		// (D) Переименование папки
+		realdom := strings.Join(parts[:len(parts)-1], "_")
+		log.Printf("[INFO] Переименовываем %s -> %s", folderName, realdom)
+		if realdom == "" {
+			log.Printf("[ERROR] realdom пуст!")
+			continue
+		}
+		oldPath := filepath.Join(WATCH_DIR, folderName)
+		newPath := filepath.Join(WATCH_DIR, realdom)
+		os.Rename(oldPath, newPath)
+		// (E) Проверка домена через CloudFlare, если используется
+		if useCloudflare {
+			if !checkDomainCloudflare(realdom) {
+				log.Println("[ERROR] Cloudflare ошибка!")
+				suffix := getErrorSuffix(baseIdx, "cloudflare")
+				newName := fmt.Sprintf("%s_%s", realdom, suffix)
+				log.Printf("[INFO] Переименовываем => %s", newName)
+				os.Rename(newPath, filepath.Join(WATCH_DIR, newName))
+				continue
+			}
+		} else {
+			log.Printf("[INFO] Пропускаем проверку CloudFlare для %s, т.к. данные CloudFlare не заданы.", realdom)
+		}
+		// (F) Установка SSL flexible через CloudFlare (если используется)
+		if useCloudflare {
+			setCFSSLMode("flexible")
+		} else {
+			log.Printf("[INFO] Пропускаем установку CloudFlare SSL (flexible) для %s.", realdom)
+		}
+		// (G) Создание затычки (с поддержкой 80 и 443)
+		createStubConfig(realdom)
+		// (H) Проверка 9-символьного текста
+		rtext, err := generate9chars()
+		if err != nil {
+			log.Printf("[ERROR] Не смогли сгенерировать 9-символьный текст: %v", err)
+			continue
+		}
+		log.Printf("[INFO] Случайный текст: %s", rtext)
+		os.MkdirAll(filepath.Join("/var/www", realdom), 0755)
+		indexFile := filepath.Join("/var/www", realdom, "index.php")
+		os.WriteFile(indexFile, []byte(rtext), 0644)
+		runCmd("chown", "-R", "www-data:www-data", filepath.Join("/var/www", realdom))
+		runCmd("find", filepath.Join("/var/www", realdom), "-type", "d", "-exec", "chmod", "755", "{}", ";")
+		runCmd("find", filepath.Join("/var/www", realdom), "-type", "f", "-exec", "chmod", "644", "{}", ";")
+		if !checkText3Attempts(realdom, rtext) {
+			log.Printf("[ERROR] Не нашли текст %s!", rtext)
+			suffix := getErrorSuffix(baseIdx, "check_text")
+			newName := fmt.Sprintf("%s_%s", realdom, suffix)
+			os.Remove(filepath.Join(NGINX_ENABLED, realdom))
+			os.Remove(filepath.Join(NGINX_AVAILABLE, realdom))
+			os.Rename(filepath.Join("/var/www", realdom), filepath.Join("/var/www", newName))
+			continue
+		} else {
+			log.Printf("[INFO] Текст найден, удаляем проверочный index.php...")
+			os.Remove(indexFile)
+		}
+		// (I) Определяем тип сайта, необходимость SSL и использование www
+		siteType := "static"
+		sslNeeded := "no"
+		useWww := "no"
+		switch baseIdx {
+		case "0":
+			siteType = "static"
+			sslNeeded = "no"
+			useWww = "no"
+		case "1":
+			siteType = "static"
+			sslNeeded = "no"
+			useWww = "yes"
+		case "2":
+			siteType = "static"
+			sslNeeded = "yes"
+			useWww = "no"
+		case "3":
+			siteType = "static"
+			sslNeeded = "yes"
+			useWww = "yes"
+		case "4":
+			siteType = "wp"
+			sslNeeded = "no"
+			useWww = "no"
+		case "5":
+			siteType = "wp"
+			sslNeeded = "no"
+			useWww = "yes"
+		case "6":
+			siteType = "wp"
+			sslNeeded = "yes"
+			useWww = "no"
+		case "7":
+			siteType = "wp"
+			sslNeeded = "yes"
+			useWww = "yes"
+		}
+		log.Printf("[INFO] site_type=%s, ssl_needed=%s, domain=%s", siteType, sslNeeded, realdom)
+		// (J) Генерация паролей
+		dbPass, _ := runCmdOutput("bash", "-c", "openssl rand -base64 12 | tr -dc A-Za-z0-9 | head -c9")
+		adminPass, _ := runCmdOutput("bash", "-c", "openssl rand -base64 12 | tr -dc A-Za-z0-9 | head -c12")
+		// (K) Выбор финального шаблона
+		finalTemplate := ""
+		if sslNeeded == "no" && useWww == "no" {
+			finalTemplate = TPL_NOSSL_NOWWW
+		} else if sslNeeded == "no" && useWww == "yes" {
+			finalTemplate = TPL_NOSSL_WWW
+		} else if sslNeeded == "yes" && useWww == "no" {
+			finalTemplate = TPL_SSL_NOWWW
+		} else {
+			finalTemplate = TPL_SSL_WWW
+		}
+		// (L) Деплой: статический сайт или WordPress
+		if siteType == "static" {
+			log.Println("[INFO] Статический => создаём index.php c 'IN'")
+			os.WriteFile(filepath.Join("/var/www", realdom, "index.php"), []byte("<?php echo 'IN'; ?>"), 0644)
+		} else {
+			log.Println("[INFO] Устанавливаем WordPress...")
+			os.Chdir(filepath.Join("/var/www", realdom))
+			runCmd("wp", "core", "download", "--allow-root")
+			runCmd("mysql", "-u", "root", "-e", fmt.Sprintf("CREATE DATABASE `%s`;", realdom))
+			runCmd("mysql", "-u", "root", "-e", fmt.Sprintf("CREATE USER '%s'@'localhost' IDENTIFIED BY '%s';", realdom, dbPass))
+			runCmd("mysql", "-u", "root", "-e", fmt.Sprintf("GRANT ALL ON `%s`.* TO '%s'@'localhost';", realdom, realdom))
+			runCmd("mysql", "-u", "root", "-e", "FLUSH PRIVILEGES;")
+			runCmd("wp", "config", "create",
+				fmt.Sprintf("--dbname=%s", realdom),
+				fmt.Sprintf("--dbuser=%s", realdom),
+				fmt.Sprintf("--dbpass=%s", dbPass),
+				"--dbhost=localhost",
+				"--allow-root",
+			)
+			fcfg, _ := os.OpenFile("wp-config.php", os.O_APPEND|os.O_WRONLY, 0644)
+			if fcfg != nil {
+				fcfg.WriteString("define('FS_METHOD','direct');\n")
+				fcfg.Close()
+			}
+			siteURL := fmt.Sprintf("https://%s", realdom)
+			if useWww == "yes" {
+				siteURL = fmt.Sprintf("https://www.%s", realdom)
+			}
+			runCmd("wp", "core", "install",
+				fmt.Sprintf("--url=%s", siteURL),
+				fmt.Sprintf("--title=%s Site", realdom),
+				fmt.Sprintf("--admin_user=%s", realdom),
+				fmt.Sprintf("--admin_password=%s", adminPass),
+				fmt.Sprintf("--admin_email=admin@%s", realdom),
+				"--allow-root",
+			)
+			fwp, _ := os.OpenFile(WP_LOG, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+			if fwp != nil {
+				line := fmt.Sprintf("%s|%s|%s|%s|%s\n", realdom, realdom, adminPass, realdom, dbPass)
+				fwp.WriteString(line)
+				fwp.Close()
+			}
+		}
+		runCmd("chown", "-R", "www-data:www-data", filepath.Join("/var/www", realdom))
+		runCmd("find", filepath.Join("/var/www", realdom), "-type", "d", "-exec", "chmod", "755", "{}", ";")
+		runCmd("find", filepath.Join("/var/www", realdom), "-type", "f", "-exec", "chmod", "644", "{}", ";")
+		// (M) Если нужен SSL, запускаем certbot и обновляем конфигурацию
+		if sslNeeded == "yes" {
+			log.Printf("[INFO] Выпускаем SSL (certbot) для %s...", realdom)
+			errC := runCmd("certbot", "--nginx", "-d", realdom, "--non-interactive", "--agree-tos", "-m", fmt.Sprintf("admin@%s", realdom))
+			if errC == nil {
+				log.Println("[INFO] SSL выпущен => убираем затычку, ставим финальный SSL, CF=full")
+				os.Remove(filepath.Join(NGINX_ENABLED, realdom))
+				os.Remove(filepath.Join(NGINX_AVAILABLE, realdom))
+				newConf := filepath.Join(NGINX_AVAILABLE, realdom)
+				dataTempl, errF := os.ReadFile(finalTemplate)
+				if errF == nil {
+					confText := strings.ReplaceAll(string(dataTempl), "{{ domain_name }}", realdom)
+					os.WriteFile(newConf, []byte(confText), 0644)
+				}
+				os.Symlink(newConf, filepath.Join(NGINX_ENABLED, realdom))
+				runCmd("nginx", "-t")
+				runCmd("systemctl", "reload", "nginx")
+				if useCloudflare {
+					setCFSSLMode("full")
+				} else {
+					log.Printf("[INFO] Пропускаем установку CloudFlare SSL (full) для %s.", realdom)
+				}
+				// Удаляем временные самоподписанные сертификаты, так как теперь используется валидный сертификат
+				selfSignedDir := "/etc/nginx/self-signed"
+				certPath := filepath.Join(selfSignedDir, realdom+".crt")
+				keyPath := filepath.Join(selfSignedDir, realdom+".key")
+				os.Remove(certPath)
+				os.Remove(keyPath)
+				log.Printf("[INFO] Удалены временные самоподписанные сертификаты для %s", realdom)
+			} else {
+				log.Println("[ERROR] Ошибка SSL!")
+				suffix := getErrorSuffix(baseIdx, "other")
+				newName := fmt.Sprintf("%s_%s", realdom, suffix)
+				os.Remove(filepath.Join(NGINX_ENABLED, realdom))
+				os.Remove(filepath.Join(NGINX_AVAILABLE, realdom))
+				os.RemoveAll(filepath.Join("/var/www", realdom))
+				os.RemoveAll(filepath.Join("/etc/letsencrypt/live", realdom))
+				os.RemoveAll(filepath.Join("/etc/letsencrypt/archive", realdom))
+				os.Remove(filepath.Join("/etc/letsencrypt/renewal", realdom+".conf"))
+				os.Mkdir(filepath.Join(WATCH_DIR, newName), 0755)
+				runCmd("nginx", "-t")
+				runCmd("systemctl", "reload", "nginx")
+				continue
+			}
+		} else {
+			log.Println("[INFO] SSL не нужен => убираем затычку, ставим final_template, CF=flexible")
+			os.Remove(filepath.Join(NGINX_ENABLED, realdom))
+			os.Remove(filepath.Join(NGINX_AVAILABLE, realdom))
+			newConf := filepath.Join(NGINX_AVAILABLE, realdom)
+			dataTempl, errF := os.ReadFile(finalTemplate)
+			if errF == nil {
+				confText := strings.ReplaceAll(string(dataTempl), "{{ domain_name }}", realdom)
+				os.WriteFile(newConf, []byte(confText), 0644)
+			}
+			os.Symlink(newConf, filepath.Join(NGINX_ENABLED, realdom))
+			runCmd("nginx", "-t")
+			runCmd("systemctl", "reload", "nginx")
+			if useCloudflare {
+				setCFSSLMode("flexible")
+			} else {
+				log.Printf("[INFO] Пропускаем установку CloudFlare SSL (flexible) для %s.", realdom)
+			}
+		}
+		// (N) Применяем дефолтные настройки CloudFlare, если используется
+		if useCloudflare {
+			log.Println("[INFO] Применяем финальные дефолтные настройки CF...")
+			applyDefaultCFSettings()
+		} else {
+			log.Println("[INFO] CloudFlare не настроен, пропускаем применение настроек CF.")
+		}
+		log.Printf("[INFO] Сайт %s развернут успешно.", realdom)
 	}
 	if err := cmd.Wait(); err != nil {
 		log.Printf("[ERROR] inotifywait завершился с ошибкой: %v", err)
